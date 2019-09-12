@@ -1,0 +1,7 @@
+2019/09/11 21:00:19 result not consistent:
+2019/09/11 21:00:19 create table Test(id integer, title varchar(100));
+insert into Test(id, title) values(1, "Hello");
+select * from Test;
+-- Here your code !
+show databases;
+
