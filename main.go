@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"log"
 	"os"
@@ -22,6 +23,16 @@ var (
 	tiPasswd string
 	tiUser string
 )
+
+const batch = 5000
+
+type batchResult struct {
+	err error
+	successCounter int
+	failCounter int
+	filteredCount int
+	count int
+}
 
 var rootCmd = &cobra.Command{
 	Use:"playground test",
@@ -46,59 +57,52 @@ var rootCmd = &cobra.Command{
 			User:tiUser,
 			Password:tiPasswd,
 		}
-		tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
-		if err != nil {
-			panic(err)
-		}
-		setDb(tidb)
 
-		rows, err := mysql.Query("select * from stmts")
+		tCnt, err := tableCnt(mysql, "stmts")
 		if err != nil {
 			panic(err)
 		}
 
-		var id int
-		var uid, result, source, stdout string
+		offset := 0
+		batchNum := 0
+		resCh := make(chan *batchResult)
+		for offset < tCnt {
+			sql := fmt.Sprintf("select * from stmts limit %d,%d",
+				offset, batch)
 
-		logger, file, err := getLogger()
-		if err != nil {
-			panic("open log file error")
+			go batchCompare(mysql, tiConfig, offset, sql, resCh)
+
+			offset += batch
+			batchNum++
 		}
-
-		defer file.Close()
 
 		counter := 0
 		successCounter := 0
 		failCounter := 0
 		filteredCount := 0
 
-		for rows.Next() {
-			log.Printf("starting execute %d sql\n", counter)
-			rows.Scan(&id, &uid, &result, &source, &stdout)
-
-			consistent, filtered := compare(tidb, source, stdout, result)
-			if filtered {
-				filteredCount++
-			} else if consistent {
-				log.Printf("%d sql compare end, success\n", counter)
-				successCounter++
+		for i := 0; i < batchNum; i++ {
+			res := <- resCh
+			if res.err != nil {
+				panic(res.err)
 			} else {
-				logger.Println("result not consistent:")
-				logger.Println(source)
-				log.Printf("%d sql compare end, fail\n", counter)
-				failCounter++
+				counter += res.count
+				successCounter += res.successCounter
+				failCounter += res.failCounter
+				filteredCount += res.filteredCount
 			}
-
-			counter++
 		}
 
-		if rows.Err() != nil {
-			fmt.Println(rows.Err())
-		}
+		log.Printf(`
+Summary:
+	total: %d
+	success count: %d
+	fail count: %d
+	filtered count: %d
+`, counter, successCounter, failCounter, filteredCount)
 
-		log.Println("playground test ok")
-		logger.Printf("Summary:\n\tsuccess count: %d\n\tfail count: %d\n\tfiltered count: %d",
-			successCounter, failCounter, filteredCount)
+
+
 	},
 }
 
@@ -106,6 +110,89 @@ func setDb(db *sql.DB) {
 	db.SetMaxIdleConns(100)
 	db.SetMaxOpenConns(100)
 }
+
+func batchCompare(mysql *sql.DB, tiConfig *Config, offset int, stmtSql string, resCh chan *batchResult) {
+	rows, err := mysql.Query(stmtSql)
+	if err != nil {
+		resCh <- &batchResult{err:errors.WithStack(err)}
+		return
+	}
+
+	logger, file, err := getLogger(offset)
+	if err != nil {
+		resCh <- &batchResult{err:errors.WithStack(err)}
+		return
+	}
+
+	defer file.Close()
+
+
+	tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
+	if err != nil {
+		resCh <- &batchResult{err:err}
+		return
+	}
+	setDb(tidb)
+
+	tempdb := fmt.Sprintf("playground%d", offset)
+
+	counter := 0
+	successCounter := 0
+	failCounter := 0
+	filteredCount := 0
+
+	var id int
+	var uid, resultStr, source, stdoutStr string
+	var result sql.NullString
+	var stdout sql.NullString
+	for rows.Next() {
+		err := rows.Scan(&id, &uid, &result, &source, &stdout)
+		if err != nil {
+			resCh <- &batchResult{err:errors.WithStack(err)}
+			return
+		}
+		logger.Printf("starting execute %d sql\n", offset + counter)
+
+		if result.Valid {
+			resultStr = result.String
+		} else {
+			resultStr = ""
+		}
+
+		if stdout.Valid {
+			stdoutStr = stdout.String
+		} else {
+			stdoutStr = ""
+		}
+
+		consistent, filtered := compare(tidb, source, stdoutStr, resultStr, tempdb)
+		if filtered {
+			filteredCount++
+		} else if consistent {
+			logger.Printf("%d sql compare end, success\n", offset + counter + 1)
+			successCounter++
+		} else {
+			logger.Println("result not consistent sqls:")
+			logger.Println(source)
+			logger.Printf("%d sql compare end, fail\n", offset + counter + 1)
+			failCounter++
+		}
+
+		counter++
+	}
+
+	logger.Printf("playground test offset %d ok\n", offset)
+	logger.Printf("Summary:\n\tsuccess count: %d\n\tfail count: %d\n\tfiltered count: %d",
+		successCounter, failCounter, filteredCount)
+
+	resCh <- &batchResult{
+		successCounter:successCounter,
+		failCounter:failCounter,
+		filteredCount:filteredCount,
+		count:counter,
+	}
+}
+
 
 func filter(source string, filterStrs ... string) bool {
 
@@ -120,30 +207,33 @@ func filter(source string, filterStrs ... string) bool {
 	return false
 }
 
-func compare(tidb *sql.DB, source string, expected string, result string) (consistent bool,
+func compare(tidb *sql.DB, source string, expected string, result string, tempdb string) (consistent bool,
 	filtered bool) {
 
 	if filter(source, "show databases",
-		"select version()", "create schema", "use mysql", "desc", "test",
+		"select version()", "schema", "database", "use mysql", "desc",
 		"select now()", "explain") {
 		return false, true
 	}
 
-	if result == "timeout" {
+	if result == "timeout" || result == "" {
 		return false, true
 	}
 
-	_, err := tidb.Exec("drop database if exists playground")
+	_, err := tidb.Exec(
+		fmt.Sprintf("drop database if exists %s", tempdb))
 	if err != nil {
 		return false, false
 	}
 
-	_, err = tidb.Exec("create database playground")
+	_, err = tidb.Exec(
+		fmt.Sprintf("create database %s", tempdb))
 	if err != nil {
 		return false, false
 	}
 
-	_, err = tidb.Exec("use playground")
+	_, err = tidb.Exec(
+		fmt.Sprintf("use %s", tempdb))
 	if err != nil {
 		return false, false
 	}
@@ -264,13 +354,29 @@ func openDBWithRetry(driverName, dataSourceName string, retryCnt int) (mdb *sql.
 }
 
 
-func getLogger() (*log.Logger, *os.File, error) {
-	f, err := os.OpenFile("playground.log", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+func getLogger(offset int) (*log.Logger, *os.File, error) {
+	f, err := os.OpenFile(
+		fmt.Sprintf("playground-%d.log", offset),
+		os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, nil, err
 	}
 	logger := log.New(f, "", log.LstdFlags)
 	return logger, f, nil
+}
+
+func tableCnt(db *sql.DB, table string) (int, error) {
+	rows, err := db.Query(
+		fmt.Sprintf("select count(*) from %s", table))
+	if err != nil {
+		return 0, err
+	}
+
+	rows.Next()
+	var cnt int
+	rows.Scan(&cnt)
+
+	return cnt, nil
 }
 
 

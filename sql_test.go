@@ -8,10 +8,10 @@ import (
 
 func TestExecSql(t *testing.T) {
 	myConfig := &Config{
-		Host: "localhost",
-		Port: 3306,
-		User: "root",
-		Password:"123456",
+		Host:     "localhost",
+		Port:     3306,
+		User:     "root",
+		Password: "123456",
 	}
 
 	mdb, err := openDBWithRetry("mysql", myConfig.DSN(), 10)
@@ -44,16 +44,32 @@ select e.name, d.name from emp e right join dept d on e.dept_id = d.dept_id orde
 `
 
 	tiConfig := &Config{
-		Host:"127.0.0.1",
-		Port:4000,
-		User:"root",
+		Host: "127.0.0.1",
+		Port: 4000,
+		User: "root",
 	}
 	tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
 	assert.Equal(t, nil, err)
 
 	consistent, filtered := compare(tidb, sql, "NULL\tううう\nemp1\tあああ\nemp2\tあああ\nemp4\tいいい\n",
-		"success")
+		"success", "playtest")
 
 	assert.Equal(t, false, filtered)
 	assert.Equal(t, true, consistent)
+}
+
+func TestDblCnt(t *testing.T) {
+	myConfig := &Config{
+		Host:     "127.0.0.1",
+		Port:     3306,
+		User:     "root",
+		Password: "123456",
+		DB:       "crawl",
+	}
+	mysql, err := openDBWithRetry("mysql", myConfig.DSN(), 10)
+	assert.Equal(t, nil, err)
+	cnt, err := tableCnt(mysql, "stmts")
+	assert.Equal(t, nil, err)
+
+	fmt.Println(cnt)
 }
