@@ -3,6 +3,10 @@ package main
 import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
+	"github.com/ziutek/mymysql/mysql"
+	_ "github.com/ziutek/mymysql/native" // Native engine
+
+	"os"
 	"testing"
 )
 
@@ -14,19 +18,12 @@ func TestExecSql(t *testing.T) {
 		Password:"123456",
 	}
 
-	mdb, err := openDBWithRetry("mysql", myConfig.DSN(), 10)
-	assert.Equal(t, nil, err)
+	mdb := openDB(myConfig)
 
 	defer mdb.Close()
 
-	rows, err := mdb.Query("create database haha;")
+	_, _, err := mdb.Query("create database haha;")
 	assert.Equal(t, nil, err)
-
-	cols, err := rows.Columns()
-	assert.Equal(t, nil, err)
-
-	fmt.Println(cols)
-	fmt.Println(rows.Next())
 }
 
 func TestCompare(t *testing.T) {
@@ -48,12 +45,58 @@ select e.name, d.name from emp e right join dept d on e.dept_id = d.dept_id orde
 		Port:4000,
 		User:"root",
 	}
-	tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
-	assert.Equal(t, nil, err)
+	tidb := openDB(tiConfig)
 
 	consistent, filtered := compare(tidb, sql, "NULL\tううう\nemp1\tあああ\nemp2\tあああ\nemp4\tいいい\n",
 		"success")
 
 	assert.Equal(t, false, filtered)
 	assert.Equal(t, true, consistent)
+}
+
+func TestMyMysql(t *testing.T) {
+	db := mysql.New("tcp", "", "127.0.0.1:4000", user, "",
+		"")
+
+	err := db.Connect()
+	if err != nil {
+		panic(err)
+	}
+
+	db.Use("test")
+
+	rows, res, err := db.Query("select * from x where id > %d", 20)
+	if err != nil {
+		panic(err)
+	}
+
+	for _, row := range rows {
+		fmt.Println("=============")
+
+		for _, col := range row {
+			if col == nil {
+				// col has NULL value
+			} else {
+				// Do something with text in col (type []byte)
+			}
+		}
+		// You can get specific value from a row
+		val1 := row[1].([]byte)
+
+		// You can use it directly if conversion isn't needed
+		os.Stdout.Write(val1)
+
+		// You can get converted value
+		number := row.Int(0)      // Zero value
+		str    := row.Str(1)      // First value
+		fmt.Printf("id: %d\n", number)
+		fmt.Printf("name: %s\n", str)
+
+		// You may get values by column name
+		first := res.Map("id")
+		second := res.Map("name")
+		id, name := row.Int(first), row.Str(second)
+		fmt.Printf("id: %d\n", id)
+		fmt.Printf("name: %s\n", name)
+	}
 }

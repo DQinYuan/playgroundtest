@@ -2,14 +2,13 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
+	"github.com/ziutek/mymysql/mysql"
+	_ "github.com/ziutek/mymysql/native"
 	"log"
 	"os"
 	"strings"
-	"time"
 )
 
 var (
@@ -34,11 +33,7 @@ var rootCmd = &cobra.Command{
 			Password:passwd,
 			DB:"crawl",
 		}
-		mysql, err := openDBWithRetry("mysql", myConfig.DSN(), 10)
-		if err != nil {
-			panic("mysql connect error")
-		}
-		setDb(mysql)
+		mysql := openDB(myConfig)
 
 		tiConfig := &Config{
 			Host:tiHost,
@@ -46,19 +41,12 @@ var rootCmd = &cobra.Command{
 			User:tiUser,
 			Password:tiPasswd,
 		}
-		tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
+		tidb := openDB(tiConfig)
+
+		rows, res, err := mysql.Query("select * from stmts")
 		if err != nil {
 			panic(err)
 		}
-		setDb(tidb)
-
-		rows, err := mysql.Query("select * from stmts")
-		if err != nil {
-			panic(err)
-		}
-
-		var id int
-		var uid, result, source, stdout string
 
 		logger, file, err := getLogger()
 		if err != nil {
@@ -67,44 +55,35 @@ var rootCmd = &cobra.Command{
 
 		defer file.Close()
 
-		counter := 0
 		successCounter := 0
 		failCounter := 0
 		filteredCount := 0
 
-		for rows.Next() {
-			log.Printf("starting execute %d sql\n", counter)
-			rows.Scan(&id, &uid, &result, &source, &stdout)
+		fmt.Printf("total rows: %d\n", len(rows))
+
+		for id, row := range rows {
+			source := row.Str(res.Map("source"))
+			stdout := row.Str(res.Map("stdout"))
+			result := row.Str(res.Map("result"))
 
 			consistent, filtered := compare(tidb, source, stdout, result)
 			if filtered {
 				filteredCount++
 			} else if consistent {
-				log.Printf("%d sql compare end, success\n", counter)
+				log.Printf("%d sql compare end, success\n", id)
 				successCounter++
 			} else {
-				logger.Println("result not consistent:")
+				logger.Printf("%d result not consistent:\n", id)
 				logger.Println(source)
-				log.Printf("%d sql compare end, fail\n", counter)
+				log.Printf("%d sql compare end, fail\n", id)
 				failCounter++
 			}
-
-			counter++
-		}
-
-		if rows.Err() != nil {
-			fmt.Println(rows.Err())
 		}
 
 		log.Println("playground test ok")
 		logger.Printf("Summary:\n\tsuccess count: %d\n\tfail count: %d\n\tfiltered count: %d",
 			successCounter, failCounter, filteredCount)
 	},
-}
-
-func setDb(db *sql.DB) {
-	db.SetMaxIdleConns(100)
-	db.SetMaxOpenConns(100)
 }
 
 func filter(source string, filterStrs ... string) bool {
@@ -120,11 +99,11 @@ func filter(source string, filterStrs ... string) bool {
 	return false
 }
 
-func compare(tidb *sql.DB, source string, expected string, result string) (consistent bool,
+func compare(tidb mysql.Conn, source string, expected string, result string) (consistent bool,
 	filtered bool) {
 
 	if filter(source, "show databases",
-		"select version()", "create schema", "use mysql", "desc", "test",
+		"select version()", "create schema", "use mysql", "desc",
 		"select now()", "explain") {
 		return false, true
 	}
@@ -133,17 +112,17 @@ func compare(tidb *sql.DB, source string, expected string, result string) (consi
 		return false, true
 	}
 
-	_, err := tidb.Exec("drop database if exists playground")
+	_, _, err := tidb.Query("drop database if exists playground")
 	if err != nil {
 		return false, false
 	}
 
-	_, err = tidb.Exec("create database playground")
+	_, _, err = tidb.Query("create database playground")
 	if err != nil {
 		return false, false
 	}
 
-	_, err = tidb.Exec("use playground")
+	err = tidb.Use("playground")
 	if err != nil {
 		return false, false
 	}
@@ -158,7 +137,7 @@ func compare(tidb *sql.DB, source string, expected string, result string) (consi
 			continue
 		}
 
-		rows, err := tidb.Query(line)
+		rows, _, err := tidb.Query(line)
 		if err != nil {
 			if result != "failure" {
 				return false, false
@@ -170,8 +149,6 @@ func compare(tidb *sql.DB, source string, expected string, result string) (consi
 		if res := getRowsContent(rows); res != ""{
 			buf.WriteString(res)
 		}
-
-		rows.Close()
 	}
 
 	real := buf.String()
@@ -183,27 +160,18 @@ func compare(tidb *sql.DB, source string, expected string, result string) (consi
 	return true, false
 }
 
-func getRowsContent(rows *sql.Rows) string {
-	cols, err := rows.Columns()
-	if err != nil {
-		return ""
-	}
+func getRowsContent(rows []mysql.Row) string {
 
 	buf := &bytes.Buffer{}
-	for rows.Next() {
-		var columns = make([][]byte, len(cols))
-		var pointer = make([]interface{}, len(cols))
-		for i := range columns {
-			pointer[i] = &columns[i]
-		}
-		err := rows.Scan(pointer...)
-		if err != nil {
-			return ""
-		}
+	for _, row := range rows {
+		for index, col := range row {
+			var colStr string
+			if col == nil {
+				colStr = "NULL"
+			} else {
+				colStr = string(col.([]byte))
+			}
 
-		for index, col := range columns {
-			colStr := string(col)
-			if colStr == "" {colStr = "NULL"}
 			if index == 0 {
 				buf.WriteString(colStr)
 			} else {
@@ -237,30 +205,17 @@ func main() {
 
 // openDBWithRetry opens a database specified by its database driver name and a
 // driver-specific data source name. And it will do some retries if the connection fails.
-func openDBWithRetry(driverName, dataSourceName string, retryCnt int) (mdb *sql.DB, err error) {
-	startTime := time.Now()
-	sleepTime := time.Millisecond * 500
-	for i := 0; i < retryCnt; i++ {
-		mdb, err = sql.Open(driverName, dataSourceName)
-		if err != nil {
-			fmt.Printf("open db %s failed, retry count %d err %v\n", dataSourceName, i, err)
-			time.Sleep(sleepTime)
-			continue
-		}
-		err = mdb.Ping()
-		if err == nil {
-			break
-		}
-		fmt.Printf("ping db %s failed, retry count %d err %v\n", dataSourceName, i, err)
-		mdb.Close()
-		time.Sleep(sleepTime)
-	}
+func openDB(config *Config) mysql.Conn {
+	conn := mysql.New("tcp", "",
+		fmt.Sprintf("%s:%d", config.Host, config.Port),
+		config.User, config.Password, config.DB)
+
+	err := conn.Connect()
 	if err != nil {
-		fmt.Printf("open db %s failed %v, take time %v\n", dataSourceName, err, time.Since(startTime))
-		return nil, err
+		panic(err)
 	}
 
-	return
+	return conn
 }
 
 
