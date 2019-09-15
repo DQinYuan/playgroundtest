@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
@@ -49,13 +50,16 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			panic("mysql connect error")
 		}
-		setDb(mysql)
 
 		tiConfig := &Config{
 			Host:tiHost,
 			Port:tiPort,
 			User:tiUser,
 			Password:tiPasswd,
+		}
+		tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
+		if err != nil {
+			panic("tidb connect error")
 		}
 
 		tCnt, err := tableCnt(mysql, "stmts")
@@ -70,7 +74,13 @@ var rootCmd = &cobra.Command{
 			sql := fmt.Sprintf("select * from stmts limit %d,%d",
 				offset, batch)
 
-			go batchCompare(mysql, tiConfig, offset, sql, resCh)
+			// ensure one session per goroutine
+			conn, err := tidb.Conn(context.Background())
+			if err != nil {
+				panic(err)
+			}
+
+			go batchCompare(mysql, conn, offset, sql, resCh)
 
 			offset += batch
 			batchNum++
@@ -106,13 +116,39 @@ Summary:
 	},
 }
 
-func setDb(db *sql.DB) {
-	db.SetMaxIdleConns(100)
-	db.SetMaxOpenConns(100)
+type compareParam struct {
+	source string
+	stdout string
+	result string
 }
 
-func batchCompare(mysql *sql.DB, tiConfig *Config, offset int, stmtSql string, resCh chan *batchResult) {
-	rows, err := mysql.Query(stmtSql)
+func getAllResult(mysql *sql.DB, stmt string) ([]*compareParam, error)  {
+	rows, err := mysql.Query(stmt)
+	if err != nil {
+		return nil, err
+	}
+
+	var id int
+	var uid, result, source, stdout string
+
+	compares := make([]*compareParam, 0)
+
+	for rows.Next() {
+		if rows.Err() != nil {
+			rows.Close()
+			return nil, rows.Err()
+		}
+		rows.Scan(&id, &uid, &result, &source, &stdout)
+		compares = append(compares, &compareParam{source, stdout, result})
+	}
+
+	return compares, nil
+}
+
+func batchCompare(mysql *sql.DB, tiConn *sql.Conn, offset int, stmtSql string, resCh chan *batchResult) {
+	defer tiConn.Close()
+
+	rows, err := getAllResult(mysql, stmtSql)
 	if err != nil {
 		resCh <- &batchResult{err:errors.WithStack(err)}
 		return
@@ -126,14 +162,6 @@ func batchCompare(mysql *sql.DB, tiConfig *Config, offset int, stmtSql string, r
 
 	defer file.Close()
 
-
-	tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
-	if err != nil {
-		resCh <- &batchResult{err:err}
-		return
-	}
-	setDb(tidb)
-
 	tempdb := fmt.Sprintf("playground%d", offset)
 
 	counter := 0
@@ -141,40 +169,21 @@ func batchCompare(mysql *sql.DB, tiConfig *Config, offset int, stmtSql string, r
 	failCounter := 0
 	filteredCount := 0
 
-	var id int
-	var uid, resultStr, source, stdoutStr string
-	var result sql.NullString
-	var stdout sql.NullString
-	for rows.Next() {
-		err := rows.Scan(&id, &uid, &result, &source, &stdout)
-		if err != nil {
-			resCh <- &batchResult{err:errors.WithStack(err)}
-			return
-		}
-		logger.Printf("starting execute %d sql\n", offset + counter)
+	for index, param := range rows {
+		rowNum := offset + index
+		logger.Printf("starting execute %d sql\n", rowNum)
 
-		if result.Valid {
-			resultStr = result.String
-		} else {
-			resultStr = ""
-		}
-
-		if stdout.Valid {
-			stdoutStr = stdout.String
-		} else {
-			stdoutStr = ""
-		}
-
-		consistent, filtered := compare(tidb, source, stdoutStr, resultStr, tempdb)
+		consistent, filtered := compare(tiConn, param.source, param.stdout,
+			param.result, tempdb)
 		if filtered {
 			filteredCount++
 		} else if consistent {
-			logger.Printf("%d sql compare end, success\n", offset + counter + 1)
+			logger.Printf("%d sql compare end, success\n", rowNum)
 			successCounter++
 		} else {
 			logger.Println("result not consistent sqls:")
-			logger.Println(source)
-			logger.Printf("%d sql compare end, fail\n", offset + counter + 1)
+			logger.Println(param.source)
+			logger.Printf("%d sql compare end, fail\n", rowNum)
 			failCounter++
 		}
 
@@ -182,7 +191,11 @@ func batchCompare(mysql *sql.DB, tiConfig *Config, offset int, stmtSql string, r
 	}
 
 	logger.Printf("playground test offset %d ok\n", offset)
-	logger.Printf("Summary:\n\tsuccess count: %d\n\tfail count: %d\n\tfiltered count: %d",
+	logger.Printf(`Summary:
+	success count: %d
+	fail count: %d
+	filtered count: %d
+`,
 		successCounter, failCounter, filteredCount)
 
 	resCh <- &batchResult{
@@ -207,7 +220,7 @@ func filter(source string, filterStrs ... string) bool {
 	return false
 }
 
-func compare(tidb *sql.DB, source string, expected string, result string, tempdb string) (consistent bool,
+func compare(tiConn *sql.Conn, source string, expected string, result string, tempdb string) (consistent bool,
 	filtered bool) {
 
 	if filter(source, "show databases",
@@ -220,19 +233,19 @@ func compare(tidb *sql.DB, source string, expected string, result string, tempdb
 		return false, true
 	}
 
-	_, err := tidb.Exec(
+	_, err := tiConn.ExecContext(context.Background(),
 		fmt.Sprintf("drop database if exists %s", tempdb))
 	if err != nil {
 		return false, false
 	}
 
-	_, err = tidb.Exec(
+	_, err = tiConn.ExecContext(context.Background(),
 		fmt.Sprintf("create database %s", tempdb))
 	if err != nil {
 		return false, false
 	}
 
-	_, err = tidb.Exec(
+	_, err = tiConn.ExecContext(context.Background(),
 		fmt.Sprintf("use %s", tempdb))
 	if err != nil {
 		return false, false
@@ -248,7 +261,7 @@ func compare(tidb *sql.DB, source string, expected string, result string, tempdb
 			continue
 		}
 
-		rows, err := tidb.Query(line)
+		rows, err := tiConn.QueryContext(context.Background(), line)
 		if err != nil {
 			if result != "failure" {
 				return false, false

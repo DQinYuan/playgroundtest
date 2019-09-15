@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"testing"
@@ -51,7 +52,10 @@ select e.name, d.name from emp e right join dept d on e.dept_id = d.dept_id orde
 	tidb, err := openDBWithRetry("mysql", tiConfig.DSN(), 10)
 	assert.Equal(t, nil, err)
 
-	consistent, filtered := compare(tidb, sql, "NULL\tううう\nemp1\tあああ\nemp2\tあああ\nemp4\tいいい\n",
+	conn, err := tidb.Conn(context.Background())
+	assert.Equal(t, nil, err)
+
+	consistent, filtered := compare(conn, sql, "NULL\tううう\nemp1\tあああ\nemp2\tあああ\nemp4\tいいい\n",
 		"success", "playtest")
 
 	assert.Equal(t, false, filtered)
