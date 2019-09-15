@@ -23,6 +23,12 @@ var (
 	tiUser string
 )
 
+type compareParam struct {
+	source string
+	stdout string
+	result string
+}
+
 var rootCmd = &cobra.Command{
 	Use:"playground test",
 	Short:"test playground sql",
@@ -38,7 +44,6 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			panic("mysql connect error")
 		}
-		setDb(mysql)
 
 		tiConfig := &Config{
 			Host:tiHost,
@@ -50,7 +55,6 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			panic(err)
 		}
-		setDb(tidb)
 
 		rows, err := mysql.Query("select * from stmts")
 		if err != nil {
@@ -72,11 +76,25 @@ var rootCmd = &cobra.Command{
 		failCounter := 0
 		filteredCount := 0
 
-		for rows.Next() {
-			log.Printf("starting execute %d sql\n", counter)
-			rows.Scan(&id, &uid, &result, &source, &stdout)
+		compares := make([]*compareParam, 0)
 
-			consistent, filtered := compare(tidb, source, stdout, result)
+		start := time.Now()
+
+		fmt.Println("Start get all stmts")
+
+		for rows.Next() {
+			rows.Scan(&id, &uid, &result, &source, &stdout)
+			compares = append(compares, &compareParam{source, stdout, result})
+		}
+
+		fmt.Printf("Already get all stmts: %d, time used: %s", len(compares),
+			time.Since(start))
+
+		for _, cParam := range compares {
+			log.Printf("starting execute %d sql\n", counter)
+
+			consistent, filtered := compare(tidb, cParam.source,
+				cParam.stdout, cParam.result)
 			if filtered {
 				filteredCount++
 			} else if consistent {
@@ -102,11 +120,6 @@ var rootCmd = &cobra.Command{
 	},
 }
 
-func setDb(db *sql.DB) {
-	db.SetMaxIdleConns(100)
-	db.SetMaxOpenConns(100)
-}
-
 func filter(source string, filterStrs ... string) bool {
 
 	lowerSource := strings.ToLower(source)
@@ -124,7 +137,7 @@ func compare(tidb *sql.DB, source string, expected string, result string) (consi
 	filtered bool) {
 
 	if filter(source, "show databases",
-		"select version()", "create schema", "use mysql", "desc", "test",
+		"select version()", "create schema", "create database", "use mysql", "desc", "test",
 		"select now()", "explain") {
 		return false, true
 	}
