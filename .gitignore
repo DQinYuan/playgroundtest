@@ -5,5 +5,7 @@
 # IntelliJ project files
 .idea
 *.iml
+*.log
+playgroundtest
 out
 gen
