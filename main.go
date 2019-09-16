@@ -74,13 +74,7 @@ var rootCmd = &cobra.Command{
 			sql := fmt.Sprintf("select * from stmts limit %d,%d",
 				offset, batch)
 
-			// ensure one session per goroutine
-			conn, err := tidb.Conn(context.Background())
-			if err != nil {
-				panic(err)
-			}
-
-			go batchCompare(mysql, conn, offset, sql, resCh)
+			go batchCompare(mysql, tidb, offset, sql, resCh)
 
 			offset += batch
 			batchNum++
@@ -94,6 +88,7 @@ var rootCmd = &cobra.Command{
 		for i := 0; i < batchNum; i++ {
 			res := <- resCh
 			if res.err != nil {
+				fmt.Printf("%+v", res.err)
 				panic(res.err)
 			} else {
 				counter += res.count
@@ -145,9 +140,7 @@ func getAllResult(mysql *sql.DB, stmt string) ([]*compareParam, error)  {
 	return compares, nil
 }
 
-func batchCompare(mysql *sql.DB, tiConn *sql.Conn, offset int, stmtSql string, resCh chan *batchResult) {
-	defer tiConn.Close()
-
+func batchCompare(mysql *sql.DB, tidb *sql.DB, offset int, stmtSql string, resCh chan *batchResult) {
 	rows, err := getAllResult(mysql, stmtSql)
 	if err != nil {
 		resCh <- &batchResult{err:errors.WithStack(err)}
@@ -173,8 +166,14 @@ func batchCompare(mysql *sql.DB, tiConn *sql.Conn, offset int, stmtSql string, r
 		rowNum := offset + index
 		logger.Printf("starting execute %d sql\n", rowNum)
 
-		consistent, filtered := compare(tiConn, param.source, param.stdout,
+		consistent, filtered, err := compare(tidb, param.source, param.stdout,
 			param.result, tempdb)
+
+		if err != nil {
+			resCh <- &batchResult{err:errors.WithStack(err)}
+			return
+		}
+
 		if filtered {
 			filteredCount++
 		} else if consistent {
@@ -220,35 +219,44 @@ func filter(source string, filterStrs ... string) bool {
 	return false
 }
 
-func compare(tiConn *sql.Conn, source string, expected string, result string, tempdb string) (consistent bool,
-	filtered bool) {
+func compare(tidb *sql.DB, source string, expected string, result string,
+	tempdb string) (consistent bool,
+	filtered bool, err error) {
 
 	if filter(source, "show databases",
 		"select version()", "schema", "database", "use mysql", "desc",
 		"select now()", "explain") {
-		return false, true
+		return false, true, nil
 	}
 
 	if result == "timeout" || result == "" {
-		return false, true
+		return false, true, nil
 	}
 
-	_, err := tiConn.ExecContext(context.Background(),
+	// per session in one compare
+	tiConn, err := tidb.Conn(context.Background())
+	if err != nil {
+		return false, false, err
+	}
+
+	defer tiConn.Close()
+
+	_, err = tiConn.ExecContext(context.Background(),
 		fmt.Sprintf("drop database if exists %s", tempdb))
 	if err != nil {
-		return false, false
+		return false, false, err
 	}
 
 	_, err = tiConn.ExecContext(context.Background(),
 		fmt.Sprintf("create database %s", tempdb))
 	if err != nil {
-		return false, false
+		return false, false, err
 	}
 
 	_, err = tiConn.ExecContext(context.Background(),
 		fmt.Sprintf("use %s", tempdb))
 	if err != nil {
-		return false, false
+		return false, false, err
 	}
 
 	lines := strings.Split(source, "\n")
@@ -264,14 +272,16 @@ func compare(tiConn *sql.Conn, source string, expected string, result string, te
 		rows, err := tiConn.QueryContext(context.Background(), line)
 		if err != nil {
 			if result != "failure" {
-				return false, false
+				return false, false, nil
 			} else {
-				return true, false
+				return true, false, nil
 			}
 		}
 
-		if res := getRowsContent(rows); res != ""{
+		if res, err := getRowsContent(rows); err == nil {
 			buf.WriteString(res)
+		} else {
+
 		}
 
 		rows.Close()
@@ -280,20 +290,24 @@ func compare(tiConn *sql.Conn, source string, expected string, result string, te
 	real := buf.String()
 
 	if expected != "" && expected != real {
-		return false, false
+		return false, false, nil
 	}
 
-	return true, false
+	return true, false, nil
 }
 
-func getRowsContent(rows *sql.Rows) string {
+func getRowsContent(rows *sql.Rows) (string, error) {
 	cols, err := rows.Columns()
 	if err != nil {
-		return ""
+		return "", err
 	}
 
 	buf := &bytes.Buffer{}
 	for rows.Next() {
+		if rows.Err() != nil {
+			return "", rows.Err()
+		}
+
 		var columns = make([][]byte, len(cols))
 		var pointer = make([]interface{}, len(cols))
 		for i := range columns {
@@ -301,7 +315,7 @@ func getRowsContent(rows *sql.Rows) string {
 		}
 		err := rows.Scan(pointer...)
 		if err != nil {
-			return ""
+			return "", err
 		}
 
 		for index, col := range columns {
@@ -317,7 +331,7 @@ func getRowsContent(rows *sql.Rows) string {
 		buf.WriteString("\n")
 	}
 
-	return buf.String()
+	return buf.String(), nil
 }
 
 func init() {
